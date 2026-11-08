@@ -1,0 +1,5 @@
+[variants.baseline]
+instructions = "Answer directly and briefly."
+
+[variants.verify]
+instructions = "Answer directly and briefly. Where useful, name one observable check."

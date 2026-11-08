@@ -1,0 +1,7 @@
+[[tasks]]
+id = "validate-csv"
+prompt = "Explain how to verify a CSV import with duplicate rows. Use at most three sentences."
+
+[[tasks]]
+id = "review-migration"
+prompt = "Name the main risk when renaming a column in a database used by two app versions."
