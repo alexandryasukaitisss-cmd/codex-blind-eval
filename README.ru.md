@@ -1,5 +1,8 @@
 # Codex Blind Eval
 
+[![CI](https://github.com/alexandryasukaitisss-cmd/codex-blind-eval/actions/workflows/ci.yml/badge.svg)](https://github.com/alexandryasukaitisss-cmd/codex-blind-eval/actions/workflows/ci.yml)
+
+
 [English](README.md) · [MIT](LICENSE)
 
 Стали ли ответы Codex полезнее после изменения инструкций? Дайте двум настройкам одинаковые задания, сравните ответы под буквами A и B, а потом раскройте, какая настройка дала каждый ответ.

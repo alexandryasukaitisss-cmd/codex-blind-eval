@@ -1,10 +1,16 @@
 # Codex Blind Eval
 
+[![CI](https://github.com/alexandryasukaitisss-cmd/codex-blind-eval/actions/workflows/ci.yml/badge.svg)](https://github.com/alexandryasukaitisss-cmd/codex-blind-eval/actions/workflows/ci.yml)
+
+
 [Русский](README.ru.md) · [MIT](LICENSE)
 
 Did a change to your Codex instructions make its answers more useful? Give both configurations the same tasks, compare their answers as A and B, then reveal which configuration wrote each one.
 
 The tool randomizes labels and execution order independently for each task. It saves only complete answers, resumes missing attempts, and keeps ties and skipped pairs separate. You supply the tasks and judge the answers.
+
+
+![Blind A/B terminal reveal output](docs/demo-terminal.png)
 
 ## Try it offline
 
