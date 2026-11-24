@@ -1,4 +1,4 @@
-"""Pairwise, identity-blind review of two Codex configurations."""
+"""Pairwise, identity-blind A/B evaluation for Codex, Claude Code, and custom agent CLIs."""
 from __future__ import annotations
 
 import argparse
@@ -8,6 +8,7 @@ import os
 from pathlib import Path
 import random
 import re
+import shlex
 import shutil
 import subprocess
 import sys
@@ -16,10 +17,18 @@ import tomllib
 
 LETTERS = ("A", "B")
 CHOICES = (*LETTERS, "tie", "skip")
+RUNNERS = ("codex", "claude", "command")
 SLUG = re.compile(r"[a-z][a-z0-9-]{0,47}\Z")
-MODEL = re.compile(r"[a-zA-Z0-9][a-zA-Z0-9_.-]{0,99}\Z")
+MODEL = re.compile(r"[a-zA-Z0-9][a-zA-Z0-9_.:/-]{0,99}\Z")
 SETTINGS = {"model", "model_reasoning_effort"}
 EFFORTS = {"minimal", "low", "medium", "high", "xhigh"}
+CLAUDE_EFFORT_MAP = {
+    "minimal": "low",
+    "low": "low",
+    "medium": "medium",
+    "high": "high",
+    "xhigh": "xhigh",
+}
 DISABLED_FEATURES = (
     "apps", "hooks", "shell_tool", "unified_exec", "shell_snapshot",
     "plugins", "skill_search", "memories", "multi_agent",
@@ -168,6 +177,14 @@ def lock(root):
         busy.rmdir()
 
 
+def _base_env():
+    return {
+        key: os.environ[key]
+        for key in ("PATH", "LANG", "LC_ALL", "LC_CTYPE", "HOME", "USER", "TMPDIR")
+        if key in os.environ
+    }
+
+
 def invoke_codex(executable, profile, task, variant, timeout):
     # The runner evaluates prompt/instruction changes. Keep connectors, shell tools,
     # hooks, user configuration and local execution rules out of both conditions.
@@ -200,6 +217,112 @@ def invoke_codex(executable, profile, task, variant, timeout):
         return checked_text(output.read_text(encoding="utf-8"), "Codex answer", limit=128_000)
 
 
+def invoke_claude(executable, task, variant, timeout):
+    """Run Claude Code CLI in isolated, non-interactive, tool-free print mode."""
+    flags = [
+        "-p",
+        "--output-format", "text",
+        "--no-session-persistence",
+        "--tools", "",
+        "--disable-slash-commands",
+        "--no-chrome",
+        "--strict-mcp-config",
+    ]
+    instructions = variant["instructions"].strip()
+    if instructions:
+        flags.extend(("--append-system-prompt", instructions))
+    if "model" in variant:
+        flags.extend(("--model", variant["model"]))
+    if "model_reasoning_effort" in variant:
+        flags.extend(("--effort", CLAUDE_EFFORT_MAP[variant["model_reasoning_effort"]]))
+
+    env = _base_env()
+    for auth_key in ("ANTHROPIC_API_KEY", "ANTHROPIC_BASE_URL", "CLAUDE_CONFIG_DIR"):
+        if auth_key in os.environ:
+            env[auth_key] = os.environ[auth_key]
+
+    with tempfile.TemporaryDirectory(prefix="claude-blind-task-") as scratch:
+        work = Path(scratch) / "task"
+        work.mkdir(mode=0o700)
+        (work / "CLAUDE.md").write_text(variant["instructions"] + "\n", encoding="utf-8")
+        result = subprocess.run(
+            [executable, *flags], input=task["prompt"],
+            cwd=work, env=env, encoding="utf-8", stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL, timeout=timeout, check=False,
+        )
+        if result.returncode:
+            raise ValueError(f"Claude exited with status {result.returncode}")
+        raw = result.stdout or ""
+        if len(raw.encode("utf-8")) > 512_000:
+            raise ValueError("Claude answer exceeds 512 KB")
+        return checked_text(raw, "Claude answer", limit=128_000)
+
+
+def invoke_command(command_template, task, variant, timeout):
+    """Run any custom CLI runner without shell=True.
+
+    Supported placeholders inside argv tokens:
+      {instructions_file} - path to temp instructions file
+      {output_file}       - path to temp output file (reads reply from file if used, else stdout)
+      {workdir}           - isolated empty task working directory (with AGENTS.md and CLAUDE.md)
+      {model}             - variant model (or empty string)
+      {effort}            - variant reasoning effort (or empty string)
+    The task prompt is always passed on stdin.
+    """
+    if not isinstance(command_template, str) or not command_template.strip():
+        raise ValueError("command_template must be a non-empty command string")
+    tokens = shlex.split(command_template)
+    if not tokens:
+        raise ValueError("command_template parsed to an empty command")
+
+    uses_output_file = any("{output_file}" in token for token in tokens)
+    with tempfile.TemporaryDirectory(prefix="cmd-blind-task-") as scratch:
+        work = Path(scratch) / "task"
+        work.mkdir(mode=0o700)
+        instructions_text = variant["instructions"] + "\n"
+        instructions_file = Path(scratch) / "instructions.txt"
+        instructions_file.write_text(instructions_text, encoding="utf-8")
+        (work / "AGENTS.md").write_text(instructions_text, encoding="utf-8")
+        (work / "CLAUDE.md").write_text(instructions_text, encoding="utf-8")
+        output = Path(scratch) / "reply.txt"
+
+        replacements = {
+            "{instructions_file}": str(instructions_file),
+            "{output_file}": str(output),
+            "{workdir}": str(work),
+            "{model}": variant.get("model", ""),
+            "{effort}": variant.get("model_reasoning_effort", ""),
+        }
+        argv = []
+        for token in tokens:
+            replaced = token
+            for placeholder, value in replacements.items():
+                replaced = replaced.replace(placeholder, value)
+            argv.append(replaced)
+
+        env = os.environ.copy()
+        env["BLIND_EVAL_INSTRUCTIONS_FILE"] = str(instructions_file)
+        env["BLIND_EVAL_WORKDIR"] = str(work)
+        env["BLIND_EVAL_MODEL"] = variant.get("model", "")
+        env["BLIND_EVAL_EFFORT"] = variant.get("model_reasoning_effort", "")
+
+        result = subprocess.run(
+            argv, input=task["prompt"], cwd=work, env=env, encoding="utf-8",
+            stdout=subprocess.DEVNULL if uses_output_file else subprocess.PIPE,
+            stderr=subprocess.DEVNULL, timeout=timeout, check=False,
+        )
+        if result.returncode:
+            raise ValueError(f"Runner exited with status {result.returncode}")
+        if uses_output_file:
+            if output.is_symlink() or not output.is_file() or output.stat().st_size > 512_000:
+                raise ValueError("Runner returned no usable output file")
+            return checked_text(output.read_text(encoding="utf-8"), "runner answer", limit=128_000)
+        raw = result.stdout or ""
+        if len(raw.encode("utf-8")) > 512_000:
+            raise ValueError("Runner answer exceeds 512 KB")
+        return checked_text(raw, "runner answer", limit=128_000)
+
+
 def blind_sheet(root, plan):
     sheet = []
     for task in plan["tasks"]:
@@ -212,15 +335,23 @@ def blind_sheet(root, plan):
         write_json(root / "votes.json", {task["id"]: "" for task in plan["tasks"]})
 
 
-def run(root, timeout, *, executable=None):
+def run(root, timeout, *, runner="codex", executable=None, command_template=None):
     root = root.absolute()
     plan = read_run(root)
     if plan["demo"]:
-        raise ValueError("the demo does not use Codex")
-    executable = executable or shutil.which("codex")
-    if not executable:
-        raise ValueError("Codex CLI not found")
-    executable = os.path.abspath(executable)
+        raise ValueError("the demo does not invoke an external runner")
+    if runner not in RUNNERS:
+        raise ValueError(f"unsupported runner: {runner}")
+
+    resolved_exec = None
+    if runner in ("codex", "claude"):
+        resolved_exec = executable or shutil.which(runner)
+        if not resolved_exec:
+            raise ValueError(f"{runner.capitalize()} CLI not found")
+        resolved_exec = os.path.abspath(resolved_exec)
+    elif not command_template or not command_template.strip():
+        raise ValueError("--command-template is required when --runner=command")
+
     with lock(root):
         for task in plan["tasks"]:
             pair = plan["pairs"][task["id"]]
@@ -230,12 +361,17 @@ def run(root, timeout, *, executable=None):
                     continue
                 variant = plan["variants"][pair["key"][letter]]
                 try:
-                    reply = invoke_codex(executable, root / "profile", task, variant, timeout)
+                    if runner == "codex":
+                        reply = invoke_codex(resolved_exec, root / "profile", task, variant, timeout)
+                    elif runner == "claude":
+                        reply = invoke_claude(resolved_exec, task, variant, timeout)
+                    else:
+                        reply = invoke_command(command_template, task, variant, timeout)
                 except subprocess.TimeoutExpired:
-                    raise ValueError(f"{task['id']} {letter}: Codex timed out; run again to resume") from None
+                    raise ValueError(f"{task['id']} {letter}: {runner} timed out; run again to resume") from None
                 except (OSError, ValueError) as exc:
                     # Do not print stderr or paths from the runner.
-                    reason = str(exc) if type(exc) is ValueError else "could not start Codex"
+                    reason = str(exc) if type(exc) is ValueError else f"could not start {runner}"
                     raise ValueError(f"{task['id']} {letter}: {reason}; run again to resume") from None
                 atomic_write(path, reply)
         blind_sheet(root, plan)
@@ -287,19 +423,28 @@ def main():
             sub.add_argument("--variants", required=True, type=Path)
         if name == "run":
             sub.add_argument("--timeout", type=int, default=180)
+            sub.add_argument("--runner", choices=RUNNERS, default="codex")
+            sub.add_argument("--executable", default=None)
+            sub.add_argument("--command-template", default=None)
     args = parser.parse_args()
     root = args.directory
     try:
         if args.command == "prepare":
             prepare(root, load_toml(args.tasks, "tasks"), load_toml(args.variants, "variants"))
-            print("Prepared private run. Sign in to its profile before running Codex.")
+            print("Prepared private run. Run with --runner codex, --runner claude, or --runner command.")
         elif args.command == "demo":
             demo(root)
             print("Wrote blind.json and votes.json using fictional answers.")
         elif args.command == "run":
             if not 1 <= args.timeout <= 3600:
                 raise ValueError("timeout must be 1–3600 seconds")
-            run(root, args.timeout)
+            run(
+                root,
+                args.timeout,
+                runner=args.runner,
+                executable=args.executable,
+                command_template=args.command_template,
+            )
             print("Wrote blind.json and votes.json.")
         else:
             print(json.dumps(reveal(root), ensure_ascii=False, indent=2))

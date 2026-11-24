@@ -40,6 +40,44 @@ if instructions == "Second approach." and not (profile / "simulated-failure").ex
     raise SystemExit(9)
 """
 
+FAKE_CLAUDE = """
+from pathlib import Path
+import sys
+
+args = sys.argv[1:]
+assert "-p" in args
+assert args[args.index("--output-format") + 1] == "text"
+assert "--no-session-persistence" in args
+assert args[args.index("--tools") + 1] == ""
+assert "--disable-slash-commands" in args
+assert "--no-chrome" in args
+assert "--strict-mcp-config" in args
+prompt = sys.stdin.read()
+assert prompt == "A synthetic evaluation question."
+sys_prompt = args[args.index("--append-system-prompt") + 1]
+model = args[args.index("--model") + 1] if "--model" in args else "default"
+effort = args[args.index("--effort") + 1] if "--effort" in args else "default"
+assert Path("CLAUDE.md").read_text().strip() == sys_prompt
+print(f"Claude[{model}/{effort}] {sys_prompt}")
+"""
+
+FAKE_GENERIC = """
+import os
+from pathlib import Path
+import sys
+
+prompt = sys.stdin.read()
+instructions = Path(sys.argv[1]).read_text().strip()
+assert Path("AGENTS.md").read_text().strip() == instructions
+assert Path("CLAUDE.md").read_text().strip() == instructions
+assert os.environ["BLIND_EVAL_INSTRUCTIONS_FILE"] == sys.argv[1]
+reply = f"Generic({instructions}): {prompt}"
+if len(sys.argv) > 2:
+    Path(sys.argv[2]).write_text(reply, encoding="utf-8")
+else:
+    print(reply)
+"""
+
 
 class BlindEvalTest(unittest.TestCase):
     def setUp(self):
@@ -81,6 +119,48 @@ class BlindEvalTest(unittest.TestCase):
             app.run(self.root, 5, executable=str(runner))
         self.assertEqual(successful.stat().st_ino, inode)
         self.assertEqual(len(app.load_json(self.root / "blind.json")), 1)
+
+    def test_claude_runner_isolates_tools_and_maps_model_and_effort(self):
+        runner = self.root.parent / "fake-claude"
+        runner.write_text(f"#!{sys.executable}\n" + FAKE_CLAUDE, encoding="utf-8")
+        runner.chmod(0o700)
+        variants = {
+            "simple": {"instructions": "First approach.", "model": "sonnet", "model_reasoning_effort": "minimal"},
+            "verified": {"instructions": "Second approach.", "model": "opus", "model_reasoning_effort": "high"},
+        }
+        app.prepare(self.root, TASKS, variants)
+        app.run(self.root, 5, runner="claude", executable=str(runner))
+        sheet = app.load_json(self.root / "blind.json")
+        answers = {sheet[0]["A"].strip(), sheet[0]["B"].strip()}
+        self.assertEqual(
+            answers,
+            {"Claude[sonnet/low] First approach.", "Claude[opus/high] Second approach."},
+        )
+
+    def test_generic_command_runner_supports_stdout_and_output_file(self):
+        script = self.root.parent / "fake_generic.py"
+        script.write_text(FAKE_GENERIC, encoding="utf-8")
+
+        # 1. stdout mode
+        app.prepare(self.root, TASKS, VARIANTS)
+        template_stdout = f'"{sys.executable}" "{script}" "{{instructions_file}}"'
+        app.run(self.root, 5, runner="command", command_template=template_stdout)
+        sheet = app.load_json(self.root / "blind.json")
+        self.assertIn("Generic(First approach.)", sheet[0]["A"] + sheet[0]["B"])
+        self.assertIn("Generic(Second approach.)", sheet[0]["A"] + sheet[0]["B"])
+
+        # 2. {output_file} mode
+        root2 = self.root.parent / "run-file"
+        app.prepare(root2, TASKS, VARIANTS)
+        template_file = f'"{sys.executable}" "{script}" "{{instructions_file}}" "{{output_file}}"'
+        app.run(root2, 5, runner="command", command_template=template_file)
+        sheet2 = app.load_json(root2 / "blind.json")
+        self.assertIn("Generic(Second approach.)", sheet2[0]["A"] + sheet2[0]["B"])
+
+    def test_command_runner_requires_template(self):
+        app.prepare(self.root, TASKS, VARIANTS)
+        with self.assertRaisesRegex(ValueError, "command-template"):
+            app.run(self.root, 5, runner="command")
 
     def test_rejects_path_ids_and_arbitrary_codex_configuration(self):
         with self.assertRaises(ValueError):
